@@ -32,7 +32,7 @@ blocked_users = {}
 # Альбомы: {chat_id: {"media": [...], "timeout": Job, "caption": str}}
 pending_albums = {}
 ALBUM_TIMEOUT = 10  # секунд
-bot_username = "EWfsaf_Bot"
+bot_username = "-" #Ваша ссылка на бота, но без @. Пример "fddsf"
 
 # Групповые комнаты
 group_rooms = {}  # {code: {"members": {chat_id: nickname}, "created": timestamp}}
