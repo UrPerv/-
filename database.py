@@ -263,7 +263,7 @@ def save_room_member(room_code: str, user_id: int, nickname: str):
         c.execute("""
         INSERT OR REPLACE INTO room_members (room_code, user_id, nickname)
         VALUES (?, ?, ?)
-        """, (room_code, user_id, nickname))
+        """, (room_code, user_id, encrypt(nickname)))
 
 def remove_room_member(room_code: str, user_id: int):
     with sqlite3.connect(DB_PATH) as conn:
@@ -275,10 +275,8 @@ def remove_room_member(room_code: str, user_id: int):
 def restore_room_members(room_code: str):
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("""
-        SELECT user_id, nickname FROM room_members WHERE room_code = ?
-        """, (room_code,))
-        return c.fetchall()
+        c.execute("SELECT user_id, nickname FROM room_members WHERE room_code = ?", (room_code,))
+        return [(user_id, decrypt(nick)) for user_id, nick in c.fetchall()]
 
 #########################################################################
 
