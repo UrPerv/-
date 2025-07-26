@@ -1,4 +1,6 @@
 import telegram
+from state import group_rooms, global_nicknames, user_nicknames, nickname_counter, user_profiles, user_group
+from database import save_profile, load_profile, delete_profile as db_delete_profile, init_db, save_room_settings, load_room_settings, ban_user_in_room, save_global_nick, save_room_link, load_room_link, restore_all_users, restore_rooms, clear_room_link, remove_room_member, save_room_member
 import re
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
@@ -16,9 +18,8 @@ load_dotenv("db.env")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # Очередь на поиск и пары чатов
-waiting_users = []  # список chat_id
+waiting_users = set()  # список chat_id
 chat_pairs = {}  # {chat_id: partner_chat_id}
-user_profiles = {}  # {chat_id: str}
 user_interests: dict[int, set[str]] = {}
 last_seen = {}
 
@@ -36,17 +37,12 @@ blocked_users = {}
 # Альбомы: {chat_id: {"media": [...], "timeout": Job, "caption": str}}
 pending_albums = {}
 ALBUM_TIMEOUT = 10  # секунд
-bot_username = "EWfsaf_Bot"
+bot_username = "Djbsyshsb_bot"
 
 # Групповые комнаты
-group_rooms = {}  # {code: {"members": {chat_id: nickname}, "created": timestamp}}
-user_group = {}  # {chat_id: code}
-user_nicknames = {}
 user_states = {}
-nickname_counter = {}  # {code: int}
 custom_nicknames = {}  # {chat_id: nickname}
 GROUP_LIFETIME = 86400  # 24 часа
-
 
 def is_active_hours():
     now = time.localtime()
@@ -61,6 +57,16 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(
         f"👥 Онлайн: {online_users}\n🔎 В поиске: {searching}"
     )
+
+def is_moderator(chat_id, context):
+    code = user_group.get(chat_id)
+    if not code:
+        return False
+    room = group_rooms.get(code)
+    if not room:
+        return False
+    return room.get("moderator") == chat_id
+
 
 def get_stats_text():
     now = datetime.now()
@@ -97,9 +103,10 @@ async def create_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Генерация комнаты
     code = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    created = time.time()
+
     group_rooms[code] = {
         "members": {},
-        "created": time.time(),
         "moderator": chat_id if with_mod else None,
         "muted": set(),
         "banned": set(),
@@ -108,22 +115,34 @@ async def create_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "is_open": True,
         "is_private": True,
         "description": "",
+        "created": created,
     }
     nickname_counter[code] = 0
+
+    # === Сохраняем в БД ===
+    from database import save_room_settings
+    save_room_settings(
+        room_code=code,
+        welcome_message=None,
+        short_description="",
+        created=created,
+        moderator_id=chat_id if with_mod else None,
+        is_open=True,
+        is_private=True
+    )
 
     link = f"https://t.me/{bot_username}?start=group_{code}"
 
     if message:
         await message.reply_text(
-            f"🔗 Ссылка на {'модерируемую ' if with_mod else ''}групповую комнату (действует 24 часа):\n{link}"
+            f"🔗 Ссылка на {'модерируемую ' if with_mod else ''}групповую комнату:\n{link}"
         )
-
     await send_main_menu(update, context)
-
 
 
 async def make_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    message = update.message or update.callback_query.message
 
     code = user_group.get(chat_id)
     if not code or code not in group_rooms:
@@ -137,6 +156,7 @@ async def make_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def make_public(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    message = update.message or update.callback_query.message
 
     code = user_group.get(chat_id)
     if not code or code not in group_rooms:
@@ -146,6 +166,10 @@ async def make_public(update: Update, context: ContextTypes.DEFAULT_TYPE):
     room = group_rooms[code]
     room["is_private"] = False
     await update.message.reply_text("Комната теперь видна в общем списке.")
+
+    if not room or room.get("moderator") != chat_id:
+        await message.reply_text("У вас нет прав модератора.")
+        return
 
 
 async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -201,7 +225,13 @@ async def set_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     description = " ".join(context.args).strip()
     room["description"] = description[:100]  # ограничим длину
+
+    # Сохраняем и welcome и description
+    welcome = room.get("welcome") or ""
+    save_room_settings(room_code, welcome, room["description"])
+
     await update.message.reply_text("Описание комнаты обновлено.")
+
 
 async def list_active_rooms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверка активности пользователя
@@ -237,9 +267,10 @@ async def list_active_rooms(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         members_count = len(room["members"])
         is_mod = room.get("with_moderation", False)
-        description = room.get("description", "").strip()
         mod_tag = "👮" if is_mod else "👥"
         link = f"https://t.me/{bot_username}?start=group_{code}"
+        room_info = load_room_settings(code)
+        description = room_info.get("short_description", "") if room_info else ""
 
         text += f"{mod_tag} [Комната {count+1}]({link}) — {members_count} чел.\n"
         if description:
@@ -254,8 +285,6 @@ async def list_active_rooms(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await message.reply_text("📃 Список активных комнат:\n\n" + text, parse_mode=ParseMode.MARKDOWN)
 
-
-
 async def join_group(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str):
     if context.user_data.get("searching"):
         await update.message.reply_text("Сейчас идёт поиск. Чтобы остановить — используйте /stop.")
@@ -269,8 +298,8 @@ async def join_group(update: Update, context: ContextTypes.DEFAULT_TYPE, code: s
         return
 
     room = group_rooms.get(code)
-    if not room or time.time() - room['created'] > GROUP_LIFETIME:
-        await update.message.reply_text("Комната не существует или время её жизни истекло.")
+    if not room:
+        await update.message.reply_text("Комната не существует.")
         return
 
     if not room.get("is_open", True):
@@ -291,20 +320,37 @@ async def join_group(update: Update, context: ContextTypes.DEFAULT_TYPE, code: s
 
     await leave_group(chat_id, context)
 
-    # Добавляем участника
-    global_nick = user_nicknames.get(chat_id)
-    if global_nick:
-        nickname = global_nick
-    else:
+    # === Выбор ника ===
+    nickname = user_nicknames.get(chat_id)
+
+    if not nickname:
+        # Пытаемся восстановить глобальный ник из базы
+        from database import load_global_nick  # импорт в случае, если не вверху
+        nickname = load_global_nick(chat_id)
+        if nickname:
+            user_nicknames[chat_id] = nickname
+            global_nicknames[chat_id] = nickname
+
+    if not nickname:
+        link = load_room_link(chat_id)
+        if link:
+            nickname = link["nickname_in_room"]
+
+    if not nickname:
+        if code not in nickname_counter:
+            nickname_counter[code] = 0
         nickname_counter[code] += 1
         nickname = f"Аноним №{nickname_counter[code]}"
 
+    # === Добавление участника ===
     room['members'][chat_id] = nickname
     user_group[chat_id] = code
     custom_nicknames[chat_id] = nickname
 
-    room = group_rooms[code]
+    save_room_member(code, chat_id, nickname)
+    save_room_link(chat_id, code, code, nickname)
 
+    # Сообщение модератору
     if room.get("moderator") == chat_id:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -325,7 +371,7 @@ async def join_group(update: Update, context: ContextTypes.DEFAULT_TYPE, code: s
     mod_note = "\n(С модерацией)" if room.get("with_moderation") else ""
     await update.message.reply_text(f"Вы присоединились к группе.{mod_note}\nСписок участников:\n{names}")
 
-    # Отправка анкеты
+    # Отправка анкеты другим
     profile = user_profiles.get(chat_id)
     if profile:
         text = profile.get('text', '')
@@ -342,6 +388,7 @@ async def join_group(update: Update, context: ContextTypes.DEFAULT_TYPE, code: s
                                         caption=f"Анкета участника:\n{text}")
                 elif text:
                     await safe_send(context.bot, uid, "send_message", text=f"Анкета участника:\n{text}")
+
 
 
 async def mod_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -439,7 +486,7 @@ async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = update.message.text.split(maxsplit=1)[1].strip()
     room["welcome"] = welcome_text
     await update.message.reply_text("Приветственное сообщение обновлено.")
-
+    save_room_settings(code, room["welcome"])
 
 async def preview_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("profile_creating"):
@@ -523,43 +570,63 @@ async def open_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def mod_action(update: Update, context: ContextTypes.DEFAULT_TYPE, action):
-    if context.user_data.get("profile_creating"):
-        await update.message.reply_text("Сейчас вы создаёте анкету. Завершите или отмените с помощью /stop.")
-        return
-
-    if context.user_data.get("searching"):
-        await update.message.reply_text("Сейчас идёт поиск. Чтобы остановить — используйте /stop.")
-        return
-
     message = update.message or update.callback_query.message
     chat_id = message.chat_id
 
-    args = context.args
+    if context.user_data.get("profile_creating"):
+        await message.reply_text("Сейчас вы создаёте анкету. Завершите или отмените с помощью /stop.")
+        return
+
+    if context.user_data.get("searching"):
+        await message.reply_text("Сейчас идёт поиск. Чтобы остановить — используйте /stop.")
+        return
+
     code = user_group.get(chat_id)
     room = group_rooms.get(code)
+
     if not room or room.get("moderator") != chat_id:
         await message.reply_text("У вас нет прав модератора.")
         return
-    if not args:
+
+    if not context.args:
         await message.reply_text("Укажите ник пользователя.")
         return
-    target_nick = " ".join(args)
-    target_id = next((uid for uid, nick in room["members"].items() if nick == target_nick), None)
+
+    target_nick = " ".join(context.args).strip().lower()
+    target_id = None
+
+    for uid, nick in room["members"].items():
+        if nick.strip().lower() == target_nick:
+            target_id = uid
+            break
+
     if not target_id:
-        await message.reply_text("Пользователь не найден.")
+        await message.reply_text("Пользователь с таким ником не найден.")
+        return
+
+    if target_id == chat_id:
+        await message.reply_text("Вы не можете применить это действие к себе.")
         return
 
     if action == "kick":
-        room['members'].pop(target_id)
+        room['members'].pop(target_id, None)
         user_group.pop(target_id, None)
         custom_nicknames.pop(target_id, None)
         await safe_send(context.bot, target_id, "send_message", text="Вы были удалены из комнаты модератором.")
+
     elif action == "mute":
+        room.setdefault('muted', set())
         room['muted'].add(target_id)
+        await safe_send(context.bot, target_id, "send_message", text="Вы были заглушены модератором.")
+
     elif action == "unmute":
+        room.setdefault('muted', set())
         room['muted'].discard(target_id)
+        await safe_send(context.bot, target_id, "send_message", text="Вы были размучены модератором.")
+
     elif action == "ban":
         room['banned'].add(target_id)
+        ban_user_in_room(target_id, code)
         room['members'].pop(target_id, None)
         user_group.pop(target_id, None)
         custom_nicknames.pop(target_id, None)
@@ -630,12 +697,12 @@ async def set_global_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     new_nick = " ".join(context.args).strip()
 
-    if nickname_counter.lower().startswith("аноним"):
-        await safe_send(context.bot, chat_id, "send_message", text="Нельзя использовать системный формат ника.")
-        return
-
     if not new_nick:
         await update.message.reply_text("Ник не может быть пустым.")
+        return
+
+    if new_nick.lower().startswith("аноним"):
+        await safe_send(context.bot, chat_id, "send_message", text="Нельзя использовать системный формат ника.")
         return
 
     if any(nick == new_nick for nick in user_nicknames.values()):
@@ -643,6 +710,7 @@ async def set_global_nick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_nicknames[chat_id] = new_nick
+    save_global_nick(chat_id, new_nick)  # ✅ Сохраняем ник в БД
     await update.message.reply_text(f"Ваш глобальный ник установлен: {new_nick}")
 
 
@@ -677,8 +745,8 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not room:
         return
 
-    if chat_id in room.get("banned", set()):
-        await safe_send(context.bot, chat_id, "send_message", text="Вы забанены в этой комнате.")
+    if ban_user_in_room(chat_id, code):
+        await update.message.reply_text("Вы были забанены в этой комнате.")
         return
 
     if chat_id in room.get("muted", set()):
@@ -805,14 +873,20 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id not in user_group:
         await update.message.reply_text("Вы не находитесь в групповой комнате.")
         return
+
     code = user_group[chat_id]
     room = group_rooms.get(code)
     if not room:
         await update.message.reply_text("Комната не найдена.")
         return
-    names = "\n".join(room["members"].values())
-    await message.reply_text(f"Список участников:\n{names}")
 
+    members = room.get("members", {})
+    if not members:
+        await message.reply_text("В этой комнате сейчас больше никого нет.")
+        return
+
+    names = "\n".join(members.values())
+    await message.reply_text(f"Список участников:\n{names}")
 
 async def send_album_group(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -865,7 +939,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start – запустить бота\n"
         "/search – найти случайного собеседника\n"
         "/interests - написать свои интересы, чтобы найти такого же\n"
-        "/stats - статистика кто сейчас в поиске и активных пользователей\n"
+        "/stats - статистика кто сейчас в потске и активных пользователей\n"
         "/stop – завершить диалог\n"
         "/profile – создать анкету\n"
         "/my_profile – посмотреть свою анкету\n"
@@ -877,8 +951,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/nick – сменить свой ник\n"
         "/set_global_nick - глобальный ник\n"
         "/view_profile (ник) - посмотреть анкету другого пользователя\n"
-        "/list_users – список участников\n"
-        "@“ник” сообщение - отправить приватно сообщение в группе\n\n"
+        "/list_users – список участников\n\n"
         "<b>Модератор комнаты:</b>\n"
         "/ban, /mute, /unmute – управление участниками\n"
         "/set_welcome – установить приветствие\n"
@@ -943,6 +1016,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         elif arg.startswith("group_"):
             code = arg[6:]
+            print(f"[Переход по ссылке]: group_{code}")
+            print(f"[Комнаты в памяти]: {list(group_rooms.keys())}")
             await join_group(update, context, code)
             return
 
@@ -1147,15 +1222,21 @@ async def handle_profile_text(update: Update, context: ContextTypes.DEFAULT_TYPE
             await message.reply_text("Вы вышли из режима ввода анкеты.")
         return
 
-    text = message.text or message.caption
+    text = message.text or message.caption or ""
+    media_id = None
+    media_type = None
 
-    user_profiles[user_id] = {
-        "text": text,
-        "photo": message.photo[-1].file_id if message.photo else None,
-        "video": message.video.file_id if message.video else None
-    }
+    if message.photo:
+        media_id = message.photo[-1].file_id
+        media_type = "photo"
+    elif message.video:
+        media_id = message.video.file_id
+        media_type = "video"
 
-    context.user_data.pop("profile_creating", None)  # Выход из режима после ввода
+    # Сохраняем в SQLite
+    save_profile(user_id, text.strip(), media_id, media_type)
+
+    context.user_data.pop("profile_creating", None)
     await message.reply_text("Анкета сохранена!\n/delete_profile - удалить анкету")
     await send_main_menu(update, context)
 
@@ -1170,19 +1251,25 @@ async def my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id  # ← ВОТ ОН
     query = update.callback_query
 
-    profile = user_profiles.get(user_id)
-    if not profile:
-        await query.message.reply_text("У вас ещё нет анкеты.")
-        return
+    profile = load_profile(user_id)
 
-    if profile.get("photo"):
-        await context.bot.send_photo(chat_id=query.message.chat_id, photo=profile["photo"], caption=profile["text"])
-    elif profile.get("video"):
-        await context.bot.send_video(chat_id=query.message.chat_id, video=profile["video"], caption=profile["text"])
+    if profile:
+        text = profile.get("text", "")
+        media_id = profile.get("media_id")
+        media_type = profile.get("media_type")
+
+        if media_id:
+            if media_type == "photo":
+                await context.bot.send_photo(chat_id=chat_id, photo=media_id, caption=text)
+            elif media_type == "video":
+                await context.bot.send_video(chat_id=chat_id, video=media_id, caption=text)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text)
     else:
-        await context.bot.send_message(chat_id=query.message.chat_id, text=profile["text"])
+        await context.bot.send_message(chat_id=chat_id, text="У вас нет анкеты.")
 
     await send_main_menu(update, context)
 
@@ -1199,12 +1286,10 @@ async def delete_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Сначала завершите текущую активность (/stop).")
         return
 
-    if is_user_busy(chat_id, context):
-        await message.reply_text("Сначала завершите текущую активность (/stop).")
-        return
-
-    if chat_id in user_profiles:
-        user_profiles.pop(chat_id)
+    # Проверка: есть ли анкета в БД
+    profile = load_profile(chat_id)
+    if profile:
+        db_delete_profile(chat_id)
         await message.reply_text("Ваша анкета была удалена.")
     else:
         await message.reply_text("У вас нет анкеты для удаления.")
@@ -1248,7 +1333,7 @@ async def view_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Пользователь с таким ником не найден.")
         return
 
-    profile = user_profiles.get(target_id)
+    profile = user_profiles.get(target_id) or load_profile(target_id)
     if not profile:
         await message.reply_text("У этого пользователя нет анкеты.")
         return
@@ -1259,11 +1344,11 @@ async def view_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if media_id:
         if media_type == 'photo':
-            await context.bot.send_photo(chat_id=chat_id, photo=media_id, caption=f"Анкета участника:\n{text}")
+            await context.bot.send_photo(chat_id=chat_id, photo=media_id, caption=f"\n{text}")
         elif media_type == 'video':
-            await context.bot.send_video(chat_id=chat_id, video=media_id, caption=f"Анкета участника:\n{text}")
+            await context.bot.send_video(chat_id=chat_id, video=media_id, caption=f"\n{text}")
     else:
-        await message.reply_text(f"Анкета участника:\n{text}")
+        await message.reply_text(f"\n{text}")
 
 #####################################################################################################
 
@@ -1278,7 +1363,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = message.chat_id
 
-    # Запрещаем поиск, если пользователь занят
+    # Проверка занятости
     if is_user_busy(chat_id, context):
         await message.reply_text("Сначала завершите текущую активность (/stop).")
         return
@@ -1288,7 +1373,7 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Сейчас идёт поиск. Чтобы остановить — используйте /stop.")
         return
 
-    # Снимаем старую ссылку, если есть
+    # Удаляем старую ссылку, если была
     if chat_id in link_owners:
         code = link_owners.pop(chat_id)
         private_links.pop(code, None)
@@ -1301,44 +1386,30 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-    # Убираем из списка, если уже там
-    if chat_id in waiting_users:
-        waiting_users.remove(chat_id)
+    # Удаляем себя из очереди ДО цикла
+    waiting_users.discard(chat_id)
 
-    # === ПОИСК ПО ИНТЕРЕСАМ ===
-    my_interests = user_interests.get(chat_id, set())
-    best_match = None
-    max_common = 0
+    print(f"[ПОИСК] {chat_id} в поиске. Очередь: {waiting_users}")
 
-    for uid in waiting_users:
-        # Пропускаем занятых
-        if is_user_busy(uid, context):
-            continue
-
-        their_interests = user_interests.get(uid, set())
-        common = len(my_interests & their_interests)
-        if common > max_common:
-            best_match = uid
-            max_common = common
-
-    if best_match:
-        waiting_users.remove(best_match)
-        await start_chat(chat_id, best_match, context)
-        return
-
-    # === СЛУЧАЙНЫЙ ПОИСК ЕСЛИ НЕТ ПОДХОДЯЩИХ ===
-    for uid in waiting_users:
-        if uid != chat_id and not is_user_busy(uid, context):
+    # === СЛУЧАЙНЫЙ ПОИСК ===
+    for uid in list(waiting_users):  # обязательно копия
+        if not is_user_busy(uid, context):
             waiting_users.remove(uid)
             await start_chat(chat_id, uid, context)
             return
 
-    # === Если никого — ждём ===
-    waiting_users.append(chat_id)
+    # Если никого не нашли — добавляем себя обратно в очередь
+    waiting_users.add(chat_id)
+
     await context.bot.send_message(
         chat_id=chat_id,
-        text= get_stats_text() + "\nОжидаем второго пользователя...\n\n/stop - Остановить поиск\n/stats - статистика"
+        text=(
+            get_stats_text() +
+            "\nОжидаем второго пользователя...\n\n/stop - Остановить поиск\n/stats - статистика"
+        )
     )
+
+
 
 async def set_interests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.callback_query.message
@@ -1500,7 +1571,8 @@ async def start_chat(chat_id, partner_id, context):
                     text="Собеседник найден! Вы можете начинать анонимный чат.")
 
     for sender_id, receiver_id in [(chat_id, partner_id), (partner_id, chat_id)]:
-        profile = user_profiles.get(sender_id)
+        profile = load_profile(sender_id)
+
         if profile:
             text = profile.get('text', '')
             media_id = profile.get('media_id')
@@ -1537,17 +1609,25 @@ async def next_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def leave_group(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    code = user_group.get(chat_id)
+    code = user_group.pop(chat_id, None)
     if not code:
         return
 
-    user_group.pop(chat_id, None)
     room = group_rooms.get(code)
-    if room:
-        nickname = custom_nicknames.pop(chat_id, "Аноним")
-        room['members'].pop(chat_id, None)
-        for uid in list(room['members']):
-            await safe_send(context.bot, uid, "send_message", text=f"{nickname} покинул комнату.")
+    if not room:
+        return
+
+    nickname = custom_nicknames.pop(chat_id, "Аноним")
+    room['members'].pop(chat_id, None)
+
+    # Удаляем из базы данных
+    remove_room_member(code, chat_id)
+    clear_room_link(chat_id)
+
+    # Уведомляем других участников
+    for uid in list(room['members']):
+        await safe_send(context.bot, uid, "send_message", text=f"{nickname} покинул комнату.")
+
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1742,8 +1822,10 @@ async def universal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Вы не находитесь в чате. Используйте /search или /create_link.")
 
-
 if __name__ == "__main__":
+    init_db()
+    restore_rooms()
+    restore_all_users()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # === КОМАНДЫ (ПОРЯДОК ВАЖЕН) ===
@@ -1802,4 +1884,6 @@ if __name__ == "__main__":
 
 
     print("Приватная сеть запущена!")
-    app.run_polling()
+    app.run_polling()  #
+
+
