@@ -12,10 +12,12 @@ import random
 import string
 from datetime import time as dt_time
 from datetime import datetime, timedelta
+from telegram.constants import ChatAction
 
 # Загрузка переменных окружения
 load_dotenv("db.env")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+INFO_FILE_PATH = "info.txt"
 
 # Очередь на поиск и пары чатов
 waiting_users = set()  # список chat_id
@@ -87,6 +89,21 @@ def get_stats_text():
     online_users = sum(1 for t in last_seen.values() if now - t < timedelta(minutes=10))
     searching = len(waiting_users)
     return f"👥 Онлайн: {online_users}\n🔎 В поиске: {searching}\n"
+
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message or update.callback_query.message
+    chat_id = message.chat_id
+
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
+
+        with open(INFO_FILE_PATH, 'rb') as f:
+            await context.bot.send_document(chat_id=chat_id, document=f, filename="О_боте.txt",
+                                            caption="📄 Подробная информация о возможностях бота.")
+    except FileNotFoundError:
+        await message.reply_text("Файл с информацией не найден.")
+    except Exception as e:
+        await message.reply_text(f"Ошибка: {e}")
 
 #################################Комната
 async def create_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -981,6 +998,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/mod - команды модератора\n"
         "/kick – удалить пользователя из комнаты\n"
         "/announce - сделать обьявление для всех участников (модератор скрыт)\n\n"
+        "/info - узнать больше\n"
         "https://github.com/UrPerv/-.git - ссылка на исходный код.\n"
         "https://t.me/Anonimnoe_Soobchenie_bot - анонимная обратная связь с разработчиком и админом.",
         parse_mode="HTML"
@@ -1884,6 +1902,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("make_private", make_private))
     app.add_handler(CommandHandler("make_public", make_public))
     app.add_handler(CommandHandler("announce", announce))
+
+    app.add_handler(CommandHandler("info", info_command))
 
     # Обработчик кнопок
     app.add_handler(CallbackQueryHandler(button_handler))
