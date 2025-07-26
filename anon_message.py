@@ -37,12 +37,26 @@ blocked_users = {}
 # Альбомы: {chat_id: {"media": [...], "timeout": Job, "caption": str}}
 pending_albums = {}
 ALBUM_TIMEOUT = 10  # секунд
-bot_username = "Djbsyshsb_bot"
+bot_username = "EWfsaf_Bot"
 
 # Групповые комнаты
 user_states = {}
 custom_nicknames = {}  # {chat_id: nickname}
 GROUP_LIFETIME = 86400  # 24 часа
+
+def save_room(room_code: str):
+    room = group_rooms.get(room_code)
+    if not room:
+        return
+    save_room_settings(
+        room_code=room_code,
+        welcome_message=room.get("welcome", ""),
+        short_description=room.get("description", ""),
+        created=room.get("created", time.time()),
+        moderator_id=room.get("moderator"),
+        is_open=room.get("is_open", True),
+        is_private=room.get("is_private", True)
+    )
 
 def is_active_hours():
     now = time.localtime()
@@ -142,35 +156,38 @@ async def create_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def make_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    message = update.message or update.callback_query.message
-
     code = user_group.get(chat_id)
+
     if not code or code not in group_rooms:
         await update.message.reply_text("Вы не находитесь в комнате.")
         return
 
     room = group_rooms[code]
+    if room.get("moderator") != chat_id:
+        await update.message.reply_text("У вас нет прав модератора.")
+        return
+
     room["is_private"] = True
+    save_room(code)
     await update.message.reply_text("Комната теперь скрыта из общего списка.")
 
-
+# Сделать комнату публичной
 async def make_public(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    message = update.message or update.callback_query.message
-
     code = user_group.get(chat_id)
+
     if not code or code not in group_rooms:
         await update.message.reply_text("Вы не находитесь в комнате.")
         return
 
     room = group_rooms[code]
-    room["is_private"] = False
-    await update.message.reply_text("Комната теперь видна в общем списке.")
-
-    if not room or room.get("moderator") != chat_id:
-        await message.reply_text("У вас нет прав модератора.")
+    if room.get("moderator") != chat_id:
+        await update.message.reply_text("У вас нет прав модератора.")
         return
 
+    room["is_private"] = False
+    save_room(code)
+    await update.message.reply_text("Комната теперь видна в общем списке.")
 
 async def announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.callback_query.message
@@ -228,10 +245,9 @@ async def set_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Сохраняем и welcome и description
     welcome = room.get("welcome") or ""
-    save_room_settings(room_code, welcome, room["description"])
+    save_room(room_code)
 
     await update.message.reply_text("Описание комнаты обновлено.")
-
 
 async def list_active_rooms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверка активности пользователя
@@ -382,14 +398,12 @@ async def join_group(update: Update, context: ContextTypes.DEFAULT_TYPE, code: s
                 if media_id:
                     if media_type == 'photo':
                         await safe_send(context.bot, uid, "send_photo", photo=media_id,
-                                        caption=f"Анкета участника:\n{text}")
+                                        caption=f"\n{text}")
                     elif media_type == 'video':
                         await safe_send(context.bot, uid, "send_video", video=media_id,
-                                        caption=f"Анкета участника:\n{text}")
+                                        caption=f"\n{text}")
                 elif text:
-                    await safe_send(context.bot, uid, "send_message", text=f"Анкета участника:\n{text}")
-
-
+                    await safe_send(context.bot, uid, "send_message", text=f"\n{text}")
 
 async def mod_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("profile_creating"):
@@ -468,25 +482,26 @@ async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message = update.message or update.callback_query.message
     chat_id = message.chat_id
+    room_code = user_group.get(chat_id)
 
-    code = user_group.get(chat_id)
-    if not code or code not in group_rooms:
-        await update.message.reply_text("Вы не находитесь в комнате.")
+    if not room_code or room_code not in group_rooms:
+        await message.reply_text("Вы не находитесь в комнате.")
         return
 
-    room = group_rooms[code]
+    room = group_rooms[room_code]
     if room.get("moderator") != chat_id:
-        await update.message.reply_text("Только модератор может установить приветствие.")
+        await message.reply_text("Только модератор может установить приветствие.")
         return
 
     if not context.args:
-        await update.message.reply_text("Укажите приветственное сообщение. Пример:\n/set_welcome Добро пожаловать...")
+        await message.reply_text("Укажите приветственное сообщение. Пример:\n/set_welcome Добро пожаловать...")
         return
 
-    welcome_text = update.message.text.split(maxsplit=1)[1].strip()
+    welcome_text = " ".join(context.args).strip()
     room["welcome"] = welcome_text
-    await update.message.reply_text("Приветственное сообщение обновлено.")
-    save_room_settings(code, room["welcome"])
+    save_room(room_code)
+
+    await message.reply_text("Приветственное сообщение обновлено.")
 
 async def preview_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("profile_creating"):
