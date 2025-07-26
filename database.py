@@ -291,8 +291,6 @@ def restore_user_state(user_id: int):
     if global_nick:
         global_nicknames[user_id] = global_nick
         user_nicknames[user_id] = global_nick  # <-- ЭТО ВАЖНО
-        print(f"[Ник восстановлен]: {user_id} -> {global_nick}")
-
 
 def restore_all_users():
     with sqlite3.connect(DB_PATH) as conn:

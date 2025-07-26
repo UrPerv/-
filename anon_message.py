@@ -1016,8 +1016,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         elif arg.startswith("group_"):
             code = arg[6:]
-            print(f"[Переход по ссылке]: group_{code}")
-            print(f"[Комнаты в памяти]: {list(group_rooms.keys())}")
             await join_group(update, context, code)
             return
 
@@ -1388,8 +1386,6 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Удаляем себя из очереди ДО цикла
     waiting_users.discard(chat_id)
-
-    print(f"[ПОИСК] {chat_id} в поиске. Очередь: {waiting_users}")
 
     # === СЛУЧАЙНЫЙ ПОИСК ===
     for uid in list(waiting_users):  # обязательно копия
