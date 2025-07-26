@@ -1,6 +1,6 @@
 import telegram
 from state import group_rooms, global_nicknames, user_nicknames, nickname_counter, user_profiles, user_group
-from database import save_profile, load_profile, delete_profile as db_delete_profile, init_db, save_room_settings, load_room_settings, ban_user_in_room, save_global_nick, save_room_link, load_room_link, restore_all_users, restore_rooms, clear_room_link, remove_room_member, save_room_member
+from database import save_profile, load_profile, delete_profile as db_delete_profile, init_db, save_room_settings, load_room_settings, ban_user_in_room, save_global_nick, save_room_link, load_room_link, restore_all_users, restore_rooms, clear_room_link, remove_room_member, save_room_member, delete_room_from_db
 import re
 from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
@@ -116,7 +116,7 @@ async def create_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Генерация комнаты
-    code = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    code = ''.join(random.choices(string.ascii_letters + string.digits, k=62))
     created = time.time()
 
     group_rooms[code] = {
@@ -463,13 +463,16 @@ async def delete_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not room or room.get("moderator") != chat_id:
         await update.message.reply_text("У вас нет прав модератора.")
         return
+
     for uid in list(room['members']):
         await safe_send(context.bot, uid, "send_message", text="Комната была удалена модератором.")
         user_group.pop(uid, None)
         custom_nicknames.pop(uid, None)
-    group_rooms.pop(code, None)
-    await update.message.reply_text("Комната удалена.")
 
+    group_rooms.pop(code, None)
+    delete_room_from_db(code)
+
+    await update.message.reply_text("Комната удалена.")
 
 async def set_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("profile_creating"):
@@ -966,7 +969,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/nick – сменить свой ник\n"
         "/set_global_nick - глобальный ник\n"
         "/view_profile (ник) - посмотреть анкету другого пользователя\n"
-        "/list_users – список участников\n\n"
+        "/list_users – список участников\n"
+        "@'ник' сообщение - написать приватно в группе (лучше использовать обычное двоеточие)\n\n"
         "<b>Модератор комнаты:</b>\n"
         "/ban, /mute, /unmute – управление участниками\n"
         "/set_welcome – установить приветствие\n"
@@ -1467,7 +1471,7 @@ async def create_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in link_owners:
         code = link_owners[chat_id]
     else:
-        code = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+        code = ''.join(random.choices(string.ascii_letters + string.digits, k=62))
         private_links[code] = chat_id
         link_owners[chat_id] = code
 
